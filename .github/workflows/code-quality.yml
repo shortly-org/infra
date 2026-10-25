@@ -1,0 +1,34 @@
+name: code-quality
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Secret scanning
+        run: docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 git /repo --redact --no-banner
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "25", cache: gradle }
+
+      - name: Format check, build, unit and integration tests, JaCoCo report
+        run: ./gradlew --no-daemon spotlessCheck build
+
+      - name: Test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          if-no-files-found: ignore
+          path: |
+            build/reports/tests/test
+            build/reports/tests/integrationTest
+            build/reports/jacoco/test

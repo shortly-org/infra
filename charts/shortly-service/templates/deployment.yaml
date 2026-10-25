@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    {{- include "shortly.labels" . | nindent 4 }}
+  annotations:
+    reloader.stakater.com/auto: "true"
+spec:
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 25% }
+  selector:
+    matchLabels: { app: {{ .Release.Name }} }
+  template:
+    metadata:
+      labels:
+        {{- include "shortly.labels" . | nindent 8 }}
+      annotations:
+        ad.datadoghq.com/app.checks: |
+          {
+            "openmetrics": {
+              "init_config": {},
+              "instances": [
+                {
+                  "openmetrics_endpoint": "http://%%host%%:{{ .Values.ports.management }}/actuator/prometheus",
+                  "namespace": "shortly",
+                  "metrics": {{ toJson .Values.datadog.metrics }}
+                }
+              ]
+            }
+          }
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      securityContext: { runAsNonRoot: true, runAsUser: 10001, seccompProfile: { type: RuntimeDefault } }
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: {{ .Values.zoneSpread.whenUnsatisfiable }}
+          labelSelector: { matchLabels: { app: {{ .Release.Name }} } }
+      containers:
+        - name: app
+          image: "{{ required "image.repository is required" .Values.image.repository }}@{{ required "image.digest is required" .Values.image.digest }}"
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] }, readOnlyRootFilesystem: true }
+          env:
+            {{- include "shortly.ddEnv" . | nindent 12 }}
+            - { name: SERVER_PORT, value: {{ .Values.ports.http | quote }} }
+            - { name: MANAGEMENT_SERVER_PORT, value: {{ .Values.ports.management | quote }} }
+            {{- range $k, $v := .Values.env }}
+            - { name: {{ $k }}, value: {{ $v | quote }} }
+            {{- end }}
+          envFrom:
+            {{- range .Values.externalSecrets.secrets }}
+            - secretRef: { name: {{ $.Release.Name }}-{{ .name }} }
+            {{- end }}
+          ports:
+            - { name: http, containerPort: {{ .Values.ports.http }} }
+            - { name: management, containerPort: {{ .Values.ports.management }} }
+          startupProbe:
+            httpGet: { path: /actuator/health/liveness, port: management }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: management }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: management }
+            periodSeconds: 10
+            failureThreshold: 6
+          lifecycle:
+            preStop: { exec: { command: ["sleep", "15"] } }
+          resources: {{ toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: tmp, emptyDir: {} }

@@ -1,0 +1,126 @@
+name: deploy-service
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: The service's name, used for its ECR repository and its Helm release
+        required: true
+        type: string
+      chart-version:
+        description: The shortly-service chart version to install
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  SERVICE: ${{ inputs.service }}
+  CHART_VERSION: ${{ inputs.chart-version }}
+  REGISTRY: ${{ vars.ECR_REGISTRY }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  validate-tag:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tag is a plain semantic version (vMAJOR.MINOR.PATCH)
+        run: |
+          if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::'$TAG' is not a release tag (vMAJOR.MINOR.PATCH)"; exit 1
+          fi
+
+  build-application:
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      IMAGE: ${{ vars.ECR_REGISTRY }}/shortly/${{ inputs.service }}:${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_ECR_PUSH_ROLE_ARN }}", aws-region: "${{ env.AWS_REGION }}" }
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - name: Build (the image builds the jar; tests already ran in code quality)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}
+          build-args: |
+            DD_GIT_REPOSITORY_URL=${{ github.server_url }}/${{ github.repository }}
+            DD_GIT_COMMIT_SHA=${{ github.sha }}
+      - name: Scan image (critical/high fail the release before anything is pushed)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+      - name: Push
+        id: push
+        run: |
+          docker push "$IMAGE"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
+          echo "digest=${digest#*@}" >> "$GITHUB_OUTPUT"
+
+  sbom-and-sign:
+    needs: build-application
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_ECR_PUSH_ROLE_ARN }}", aws-region: "${{ env.AWS_REGION }}" }
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/shortly/${{ env.SERVICE }}@${{ needs.build-application.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-release-assets: false
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the image (keyless, recorded in Rekor) and attest the SBOM
+        env:
+          IMAGE: ${{ env.REGISTRY }}/shortly/${{ env.SERVICE }}@${{ needs.build-application.outputs.digest }}
+        run: |
+          cosign sign --yes "$IMAGE"
+          cosign attest --yes --predicate sbom.cdx.json --type cyclonedx "$IMAGE"
+
+  deploy-to-eks:
+    needs: [build-application, sbom-and-sign]
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency: { group: "deploy-${{ inputs.service }}", cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ vars.AWS_DEPLOY_ROLE_ARN }}", aws-region: "${{ env.AWS_REGION }}" }
+      - uses: azure/setup-helm@v4
+        with: { version: v3.22.0 }
+      - name: Deploy (--atomic rolls back on a failed rollout)
+        env:
+          DIGEST: ${{ needs.build-application.outputs.digest }}
+        run: |
+          aws eks update-kubeconfig --name "${{ vars.EKS_CLUSTER_NAME }}" --region "$AWS_REGION"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | helm registry login --username AWS --password-stdin "$REGISTRY"
+          helm upgrade --install "$SERVICE" "oci://$REGISTRY/charts/shortly-service" \
+            --version "$CHART_VERSION" \
+            --values charts/values.production.yaml \
+            --namespace shortly \
+            --set image.repository="$REGISTRY/shortly/$SERVICE" \
+            --set image.digest="$DIGEST" \
+            --set datadog.version="$TAG" \
+            --atomic --wait --timeout 10m
+      - name: Smoke test (the service's own .github/smoke-test.sh)
+        id: smoke
+        run: bash .github/smoke-test.sh
+      - name: Roll back a release that fails its smoke test
+        if: failure() && steps.smoke.conclusion == 'failure'
+        run: helm rollback "$SERVICE" --namespace shortly --wait --timeout 10m

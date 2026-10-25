@@ -1,0 +1,31 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels: { app: {{ .Release.Name }} }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - ipBlock: { cidr: {{ .Values.vpcCidr }} }
+      ports:
+        - { port: {{ .Values.ports.http }} }
+        - { port: {{ .Values.ports.management }} }
+  egress:
+    - to: [{ ipBlock: { cidr: {{ .Values.vpcCidr }} } }]
+      ports:
+        {{- range .Values.egressPorts }}
+        - { port: {{ . }} }
+        {{- end }}
+        - { port: 8126 }
+        - { port: 8125, protocol: UDP }
+    {{- range .Values.egressNamespaces }}
+    - to: [{ namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: {{ .namespace }} } } }]
+      ports:
+        - { port: {{ .port }} }
+    {{- end }}
+    - to: [{ ipBlock: { cidr: {{ .Values.clusterDnsIp }}/32 } }]
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }

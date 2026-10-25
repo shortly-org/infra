@@ -1,0 +1,5 @@
+.idea/
+*.iml
+*.log
+.DS_Store
+local/.env

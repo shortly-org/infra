@@ -1,0 +1,10 @@
+{{- with .Values.minAvailable }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $.Release.Name }}
+spec:
+  minAvailable: {{ . }}
+  selector:
+    matchLabels: { app: {{ $.Release.Name }} }
+{{- end }}

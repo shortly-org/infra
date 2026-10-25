@@ -1,0 +1,54 @@
+image:
+  repository: ""
+  digest: ""
+
+datadog:
+  env: production
+  version: ""
+  metrics: ["shortly_.*", "jvm_.*", "hikaricp_.*"]
+
+ports:
+  http: 8080
+  management: 8081
+
+# An ALB in front of the Service, rendered when host is set. The IngressClass (the cluster's
+# alb-internet-facing or alb-internal) decides the scheme and the certificate.
+ingress:
+  host: ""
+  className: alb-internal
+
+replicas:
+  min: 1
+  max: 3
+targetCpu: 70
+
+# Renders a PodDisruptionBudget when set.
+minAvailable: null
+
+resources:
+  requests: { cpu: 500m, memory: 1Gi }
+  limits: { cpu: "1", memory: 1Gi }
+
+nodeSelector: {}
+tolerations: []
+
+# DoNotSchedule keeps the pods in different zones even when that leaves one pending.
+zoneSpread:
+  whenUnsatisfiable: ScheduleAnyway
+
+vpcCidr: 10.0.0.0/16
+# EKS Auto Mode runs CoreDNS on every node at the service CIDR's .10 address.
+clusterDnsIp: 172.20.0.10
+
+# TCP ports the pods may reach inside the VPC, besides DNS and the node's Datadog agent.
+egressPorts: [5432]
+
+# In-cluster services the pods may call, by namespace.
+egressNamespaces: []
+
+env: {}
+
+externalSecrets:
+  secretStore: aws-secrets-manager
+  refreshInterval: 1h
+  secrets: []

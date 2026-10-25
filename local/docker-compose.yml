@@ -1,0 +1,126 @@
+name: shortly
+
+x-datadog-off: &datadog-off
+  DD_TRACE_ENABLED: "false"
+  DD_PROFILING_ENABLED: "false"
+  DD_DATA_STREAMS_ENABLED: "false"
+  DD_REMOTE_CONFIGURATION_ENABLED: "false"
+  DD_INSTRUMENTATION_TELEMETRY_ENABLED: "false"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: shortly
+      POSTGRES_USER: shortly
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shortly}
+    ports: ["127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shortly -d shortly"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ../../dashboard-service/local/database-roles.sql:/docker-entrypoint-initdb.d/10-dashboard-roles.sql:ro
+      - ../../redirect-service/local/database-roles.sql:/docker-entrypoint-initdb.d/20-redirect-roles.sql:ro
+
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports: ["127.0.0.1:9094:9094"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  kafka-init:
+    image: apache/kafka:3.9.1
+    command:
+      - /opt/kafka/bin/kafka-topics.sh
+      - --bootstrap-server=kafka:9092
+      - --create
+      - --if-not-exists
+      - --topic=clicks
+      - --partitions=6
+      - --config=retention.ms=604800000
+    depends_on:
+      kafka: { condition: service_healthy }
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_HEALTH_ENABLED: "true"
+      KC_HTTP_PORT: "8083"
+    ports: ["127.0.0.1:8083:8083"]
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  dashboard-api:
+    build: ../../dashboard-service
+    image: shortly/dashboard-service:dev
+    environment:
+      <<: *datadog-off
+      DATABASE_HOST: postgres
+      DATABASE_USER: dashboard_app
+      DATABASE_PASSWORD: dashboard_app
+      DATABASE_MIGRATION_USER: dashboard_owner
+      DATABASE_MIGRATION_PASSWORD: dashboard_owner
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KEYCLOAK_SERVER_URL: http://localhost:8083
+      KEYCLOAK_INTERNAL_URL: http://keycloak:8083
+      SHORTLY_SHORT_BASE_URL: http://localhost:${REDIRECT_HOST_PORT:-8080}/
+    ports: ["127.0.0.1:8081:8081", "127.0.0.1:8085:8082"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      keycloak: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8082 && printf 'GET /actuator/health/readiness HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  redirect:
+    build: ../../redirect-service
+    image: shortly/redirect-service:dev
+    environment:
+      <<: *datadog-off
+      DATABASE_REPLICA_HOST: postgres
+      DATABASE_PRIMARY_HOST: postgres
+      DATABASE_USER: redirect_reader
+      DATABASE_PASSWORD: redirect_reader
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    ports: ["127.0.0.1:${REDIRECT_HOST_PORT:-8080}:8080", "127.0.0.1:8084:8081"]
+    depends_on:
+      dashboard-api: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+
+volumes:
+  postgres-data:
+  kafka-data:
